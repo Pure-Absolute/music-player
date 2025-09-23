@@ -1,178 +1,111 @@
 #!/usr/bin/env python3
-import threading
-import queue
-import subprocess
-import time
-import curses
-from yt_dlp import YoutubeDL
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-import shutil
+import curses, time, subprocess, json, re, requests, shutil
 
-# Shared
-result_queue = queue.Queue()
-search_results = []      # hasil search (title + id)
-stop_event = threading.Event()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
-# cache dengan batasan
-MAX_CACHE = 50
-audio_cache = OrderedDict()  # video_id -> {"title":..., "url":...}
-
-PAGE_SIZE = 10
-MAX_RESULTS = 200  # max search result disimpan di RAM
-
-# preload pool (lebih agresif = 4 worker)
-preload_executor = ThreadPoolExecutor(max_workers=4)
-
-
-def progressive_search(query, max_results=50):
-    """Ambil hasil search cepat (judul+id)"""
-    ydl_opts = {
-        "default_search": f"ytsearch{max_results}:{query}",
-        "extract_flat": "in_playlist",
-        "quiet": True,
-        "no_warnings": True,
-    }
+# ------------------ SEARCH ------------------
+def yt_search(query, limit=20):
+    url = f"https://www.youtube.com/results?search_query={query}"
+    r = requests.get(url, headers=HEADERS)
+    m = re.search(r"var ytInitialData = ({.*?});", r.text, re.S)
+    if not m:
+        return []
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            for e in info.get("entries", []):
-                if stop_event.is_set():
-                    break
-                result_queue.put(e)
-                time.sleep(0.02)  # kasih waktu ke UI
-    except Exception as ex:
-        result_queue.put({"title": f"[Search error: {ex}]", "id": None})
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print("Parse error:", e)
+        return []
+    results = []
+    contents = (
+        data.get("contents", {})
+        .get("twoColumnSearchResultsRenderer", {})
+        .get("primaryContents", {})
+        .get("sectionListRenderer", {})
+        .get("contents", [])
+    )
+    for section in contents:
+        items = section.get("itemSectionRenderer", {}).get("contents", [])
+        for item in items:
+            v = item.get("videoRenderer")
+            if not v:
+                continue
+            vid = v.get("videoId")
+            title = "".join([t.get("text", "") for t in v.get("title", {}).get("runs", [])])
+            chan = v.get("ownerText", {}).get("runs", [{}])[0].get("text", "")
+            results.append({"id": vid, "title": title, "channel": chan})
+            if len(results) >= limit:
+                return results
+    return results
 
-
-def build_video_url(video_id):
-    if not video_id:
+# ------------------ RESOLVE ------------------
+def yt_get_audio_url(video_id):
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    r = requests.get(url, headers=HEADERS)
+    m = re.search(r"var ytInitialPlayerResponse = ({.*?});", r.text, re.S)
+    if not m:
         return None
-    if video_id.startswith("http"):
-        return video_id
-    return f"https://www.youtube.com/watch?v={video_id}"
-
-
-def preload_audio(video_id):
-    """Resolve audio URL (progressive per item)"""
-    if not video_id or video_id in audio_cache:
-        return
-    video_url = build_video_url(video_id)
-    # format filter: ambil audio ringan lebih cepat
-    ydl_opts = {
-        "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-    }
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            url = info.get("url")
-            if not url and info.get("formats"):
-                for f in reversed(info["formats"]):
-                    if f.get("acodec") and f.get("acodec") != "none":
-                        url = f.get("url")
-                        break
-            title = info.get("title", video_id)
-            # masukin cache dengan batasan
-            audio_cache[video_id] = {"title": title, "url": url}
-            if len(audio_cache) > MAX_CACHE:
-                audio_cache.popitem(last=False)
-    except Exception as e:
-        audio_cache[video_id] = {"title": f"[preload error: {e}]", "url": None}
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print("Player parse error:", e)
+        return None
+    fmts = data.get("streamingData", {}).get("adaptiveFormats", [])
+    for f in fmts:
+        mime = f.get("mimeType", "")
+        if mime.startswith("audio/"):
+            return f.get("url")
+    return None
 
-
-def preload_async(video_id):
-    preload_executor.submit(preload_audio, video_id)
-
-
+# ------------------ PLAYER ------------------
 def play_stream(stream_url):
     if not stream_url:
         return
-
-    # cek player yang tersedia
     if shutil.which("ffplay"):
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", stream_url]
-    elif shutil.which("vlc"):
-        cmd = ["vlc", "--intf", "dummy", "--play-and-exit", stream_url]
     elif shutil.which("mpv"):
         cmd = ["mpv", "--no-video", stream_url]
+    elif shutil.which("vlc"):
+        cmd = ["vlc", "--intf", "dummy", "--play-and-exit", stream_url]
     elif shutil.which("termux-media-player"):
         cmd = ["termux-media-player", "play", stream_url]
     else:
-        print("No supported player found (need ffplay, vlc, mpv, or termux-media-player)")
+        print("No player found")
         return
-
     subprocess.Popen(cmd)
 
-
+# ------------------ UI ------------------
 def curses_main(stdscr, query):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.keypad(True)
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
+    results = yt_search(query, limit=30)
     selected = 0
-    top_line = 0
-    needs_redraw = True
+    top = 0
+    PAGE = 10
 
-    while not stop_event.is_set():
-        updated = False
-        # ambil hasil search baru
-        try:
-            while True:
-                e = result_queue.get_nowait()
-                search_results.append(e)
-                if len(search_results) > MAX_RESULTS:
-                    del search_results[0:len(search_results) - MAX_RESULTS]
-                updated = True
-        except queue.Empty:
-            pass
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f"Search: {query} — results: {len(results)}", w - 1)
+        stdscr.addnstr(1, 0, "(↑/↓ scroll, Enter play, q quit)", w - 1)
 
-        if updated or needs_redraw:
-            stdscr.erase()
-            height, width = stdscr.getmaxyx()
-            stdscr.addnstr(0, 0, f"Search: {query}  —  results: {len(search_results)}", width - 1)
-            stdscr.addnstr(1, 0, "(↑/↓ to scroll, Enter to play, q to quit)", width - 1)
+        if selected < top:
+            top = selected
+        elif selected >= top + PAGE:
+            top = selected - PAGE + 1
 
-            # paging
-            if selected < top_line:
-                top_line = selected
-            elif selected >= top_line + PAGE_SIZE:
-                top_line = selected - PAGE_SIZE + 1
+        visible = range(top, min(len(results), top + PAGE))
+        for i, idx in enumerate(visible):
+            r = results[idx]
+            pref = "➤" if idx == selected else "  "
+            line = f"{pref}{idx+1}. {r['title']} - {r['channel']}"
+            stdscr.addnstr(3 + i, 0, line, w - 1)
 
-            # preload buffer: 1 page + 3 item ekstra
-            buffer_end = min(len(search_results), top_line + PAGE_SIZE + 3)
-            visible = range(top_line, buffer_end)
+        stdscr.refresh()
 
-            # preload untuk visible + buffer
-            for idx in visible:
-                vid = search_results[idx].get("id")
-                if vid and vid not in audio_cache:
-                    preload_async(vid)
-
-            # render page
-            for i, idx in enumerate(visible):
-                item = search_results[idx]
-                title = (item.get("title") or "(no title)").strip()
-                uploader = item.get("uploader") or ""
-                vid = item.get("id")
-                ready = vid in audio_cache and audio_cache[vid].get("url")
-
-                pref = "➤" if idx == selected else "  "
-                mark = "*" if ready else " "
-                line = f"{pref}{mark} {idx+1}. {title} - {uploader}"
-
-                if ready:
-                    stdscr.addnstr(3 + i, 0, line, width - 1, curses.color_pair(1))
-                else:
-                    stdscr.addnstr(3 + i, 0, line, width - 1)
-
-            stdscr.refresh()
-            needs_redraw = False
-
-        # input
         try:
             key = stdscr.getch()
         except Exception:
@@ -180,41 +113,22 @@ def curses_main(stdscr, query):
 
         if key == curses.KEY_UP and selected > 0:
             selected -= 1
-            needs_redraw = True
-        elif key == curses.KEY_DOWN and selected < len(search_results) - 1:
+        elif key == curses.KEY_DOWN and selected < len(results) - 1:
             selected += 1
-            needs_redraw = True
         elif key in (curses.KEY_ENTER, 10, 13):
-            if 0 <= selected < len(search_results):
-                vid = search_results[selected].get("id")
-
-                def resolve_and_play():
-                    if vid not in audio_cache:
-                        preload_audio(vid)
-                    stream = audio_cache.get(vid, {}).get("url")
-                    if stream:
-                        play_stream(stream)
-
-                threading.Thread(target=resolve_and_play, daemon=True).start()
-                needs_redraw = True
+            vid = results[selected]["id"]
+            url = yt_get_audio_url(vid)
+            if url:
+                play_stream(url)
         elif key == ord("q"):
-            stop_event.set()
             break
 
-        time.sleep(0.1)  # loop lebih santai
+        time.sleep(0.05)
 
-    stdscr.erase()
-    stdscr.addnstr(0, 0, "Exiting...", stdscr.getmaxyx()[1] - 1)
-    stdscr.refresh()
-    time.sleep(0.3)
-
-
+# ------------------ MAIN ------------------
 if __name__ == "__main__":
     q = input("Search YouTube: ").strip()
     if not q:
-        print("No query entered.")
+        print("No query.")
     else:
-        threading.Thread(target=progressive_search, args=(q, 50), daemon=True).start()
         curses.wrapper(curses_main, q)
-        print("Bye.")
-
