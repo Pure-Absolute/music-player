@@ -2,9 +2,8 @@
 import curses
 import threading
 import time
-import os
-from utils import format_time
 import random
+from utils import format_time
 from playlists import save_playlist_to, load_playlist_from
 
 ASCII_ART = [
@@ -19,7 +18,7 @@ class TUI:
     def __init__(self, stdscr, player):
         self.stdscr = stdscr
         self.player = player
-        self.screen = "home"  # home, queue, add, search
+        self.screen = "home"
         self.cursor = 0
         self.scroll = 0
         self.running = True
@@ -28,8 +27,6 @@ class TUI:
         self.search_selected = set()
         self.search_query = ""
         self.message = ""
-        self.input_lock = threading.Lock()
-        self.playlist_save_path = None
 
     def start(self):
         curses.curs_set(0)
@@ -43,43 +40,35 @@ class TUI:
         self.stdscr.nodelay(True)
         self.loop()
 
+    def _marquee(self, key, text, width):
+        if len(text) <= width:
+            return text
+        off = self.marquee_offsets.get(key, 0)
+        view = text[off:off+width]
+        off = (off + 1) % (len(text))
+        self.marquee_offsets[key] = off
+        return view
+
     def draw_home(self, h, w):
-        # center ASCII art
         y = 2
         for line in ASCII_ART:
             self.stdscr.addstr(y, max(0,(w - len(line))//2), line, curses.color_pair(5))
             y += 1
         self.stdscr.addstr(y+1, max(0,(w-30)//2), "Press L for Queue, A Add, / Search, Q Quit", curses.color_pair(1))
 
-    def _marquee(self, key, text, width):
-        # returns substring starting at offset
-        if len(text) <= width:
-            return text
-        off = self.marquee_offsets.get(key, 0)
-        view = text[off:off+width]
-        # advance
-        off = (off + 1) % (len(text))
-        self.marquee_offsets[key] = off
-        return view
-
     def draw_queue(self, h, w):
-        self.stdscr.addstr(1, 0, "Queue (arrow up/down to navigate, Enter to play, R repeat, S shuffle, P pause)".ljust(w), curses.color_pair(1))
-        visible = h - 6
+        self.stdscr.addstr(1, 0, "Queue (↑↓ navigate, Enter play, R repeat, T repeat playlist, H shuffle, Space pause)".ljust(w), curses.color_pair(1))
         q = self.player.queue
-        if self.player.shuffle:
-            shuffle_note = " (shuffle ON)"
-        else:
-            shuffle_note = ""
-        self.stdscr.addstr(2, 0, f"RepeatSong: {self.player.repeat_song}  RepeatPlaylist: {self.player.repeat_playlist}  Shuffle:{self.player.shuffle}{shuffle_note}".ljust(w), curses.color_pair(2))
-        start = max(0, self.cursor - visible//2)
-        for i in range(start, min(len(q), start + visible)):
+        start = max(0, self.cursor - (h-10)//2)
+        for i in range(start, min(len(q), start + (h-10))):
             t = q[i]["title"]
-            marker = "➤ " if i == self.cursor else "  "
-            line_w = w - 6
+            d = q[i].get("duration_str", "")
             key = f"q{i}"
-            display = self._marquee(key, t, line_w) if i == self.cursor else (t[:line_w])
+            marker = "➤ " if i == self.cursor else "  "
+            display = self._marquee(key, t, w-20) if i == self.cursor else t[:w-20]
             color = curses.color_pair(3) if i == self.player.idx else curses.color_pair(2)
-            self.stdscr.addstr(4 + i - start, 0, (marker + display).ljust(w-1), color)
+            line = f"{marker}{display} ({d})"
+            self.stdscr.addstr(3 + i - start, 0, line[:w-1], color)
 
     def draw_playing_bar(self, h, w):
         if 0 <= self.player.idx < len(self.player.queue):
@@ -88,12 +77,11 @@ class TUI:
             s = f"Now: {title}"
             s_trunc = s if len(s) < w-2 else self._marquee("now", s, w-10)
             self.stdscr.addstr(h-4, 0, s_trunc.ljust(w-1), curses.color_pair(3))
-            # progress
-            dur = self.player.duration
-            elapsed = self.player.elapsed
-            if dur:
+            if self.player.duration:
+                dur = self.player.duration
+                elapsed = self.player.elapsed
                 barlen = max(10, w-30)
-                filled = int(barlen * (elapsed / dur)) if dur else 0
+                filled = int(barlen * (elapsed / dur))
                 bar = "█"*filled + "-"*(barlen-filled)
                 times = f"{format_time(elapsed)}/{format_time(dur)}"
                 self.stdscr.addstr(h-3, 0, f"[{bar}] {times}".ljust(w-1))
@@ -107,104 +95,85 @@ class TUI:
         if self.message:
             self.stdscr.addstr(h-2, 0, self.message[:w-1], curses.color_pair(4))
 
+    def draw_search(self, h, w):
+        self.stdscr.addstr(2, 0, f"Search results for '{self.search_query}' (press numbers to toggle select, A to add)".ljust(w), curses.color_pair(1))
+        for i, item in enumerate(self.search_results):
+            mark = "[x]" if i in self.search_selected else "[ ]"
+            t, d, u = item  # tuple
+            line = f"{i+1}. {mark} {t} ({d})"
+            self.stdscr.addstr(4+i, 0, line[:w-1], curses.color_pair(2))
+
     def loop(self):
         last_check = 0
         while self.running:
             self.stdscr.erase()
             h, w = self.stdscr.getmaxyx()
-            # header
-            self.stdscr.addstr(0, 0, "🎵 Termux Music Player (Home L:Queue A:Add /:Search)".ljust(w), curses.color_pair(1))
+            self.stdscr.addstr(0, 0, "🎵 Termux Music Player (Home L:Queue A:Add /:Search Q:Quit)".ljust(w), curses.color_pair(1))
 
-            # screen specific
             if self.screen == "home":
                 self.draw_home(h, w)
             elif self.screen == "queue":
                 self.draw_queue(h, w)
-            elif self.screen == "add":
-                self.stdscr.addstr(2, 0, "Add mode (A). Enter URL or Title (top result will be auto-added). Press ESC to cancel.".ljust(w), curses.color_pair(1))
             elif self.screen == "search":
-                self.stdscr.addstr(2, 0, f"Search results for '{self.search_query}' (press numbers to toggle select, A to add selected)".ljust(w), curses.color_pair(1))
-                for i, item in enumerate(self.search_results):
-                    mark = "[x]" if i in self.search_selected else "[ ]"
-                    t = item["title"]
-                    line = f"{i+1}. {mark} {t}"
-                    self.stdscr.addstr(4+i, 0, line[:w-1], curses.color_pair(2))
+                self.draw_search(h, w)
 
-            # playing bar & footer
-            self.draw_playing_bar(h,w)
-            controls = "Controls: L Queue  A Add  / Search  Space Pause  Enter Play  N Next  B Prev  R RepeatSong  T RepeatPlaylist  H Shuffle  V Volume  S Save  O Load  Q Quit"
+            self.draw_playing_bar(h, w)
+            controls = "Controls: L Queue | A Add | / Search | Space Pause | Enter Play | N Next | B Prev | R RepeatSong | T RepeatPlaylist | H Shuffle | V Volume | S Save | O Load | Q Quit"
             self.stdscr.addstr(h-1, 0, controls[:w-1], curses.color_pair(5))
-            self.draw_message(h,w)
+            self.draw_message(h, w)
             self.stdscr.refresh()
 
-            # every 0.4s update marquee and check if song ended to auto-play next
             now = time.time()
             if now - last_check > 0.4:
                 last_check = now
-                # if playing ended (mpv process ended but player.playing false)
                 if not self.player.playing and not self.player.loading and self.player.idx != -1:
-                    # attempt auto-next
-                    if self.player._mpv_proc is None:
-                        # ended
-                        if self.player.repeat_song:
-                            self.player.play_index(self.player.idx)
-                        else:
-                            # next or repeat playlist
-                            if self.player.idx + 1 < len(self.player.queue):
-                                self.player.play_index(self.player.idx + 1)
-                            else:
-                                if self.player.repeat_playlist and len(self.player.queue)>0:
-                                    self.player.play_index(0)
-                # update marquee offsets (advance)
+                    if self.player.repeat_song:
+                        self.player.play_index(self.player.idx)
+                    elif self.player.idx + 1 < len(self.player.queue):
+                        self.player.play_index(self.player.idx + 1)
+                    elif self.player.repeat_playlist and self.player.queue:
+                        self.player.play_index(0)
                 for k in list(self.marquee_offsets.keys()):
                     self.marquee_offsets[k] = (self.marquee_offsets.get(k,0)+1) % 200
 
-            # handle input
             try:
                 ch = self.stdscr.getch()
             except Exception:
                 ch = -1
-
             if ch == -1:
-                time.sleep(0.04)
+                time.sleep(0.05)
                 continue
 
-            # KEY HANDLERS
             if ch in (ord('q'), ord('Q')):
                 self.player.stop()
                 self.running = False
                 break
-            if ch in (ord('l'), ord('L')):
+            elif ch in (ord('l'), ord('L')):
                 self.screen = "queue"
             elif ch in (ord('h'), ord('H')):
-                # toggle shuffle
                 self.player.shuffle = not self.player.shuffle
                 if self.player.shuffle:
                     random.shuffle(self.player.queue)
-                self.message = f"Shuffle set to {self.player.shuffle}"
+                self.message = f"Shuffle = {self.player.shuffle}"
             elif ch in (ord('a'), ord('A')):
-                # go into add mode, blocking input for query
-                self.screen = "add"
+                self.screen = "home"
                 curses.echo()
                 self.stdscr.nodelay(False)
-                self.stdscr.addstr(4,0,"Enter URL or Title (top result will be added): ")
-                q = self.stdscr.getstr(4, 42).decode("utf-8").strip()
+                self.stdscr.addstr(4,0,"Enter URL or Title: ")
+                q = self.stdscr.getstr(4, 22).decode("utf-8").strip()
                 self.stdscr.nodelay(True)
                 curses.noecho()
                 if q:
-                    # fetch top result in background
                     self.message = "Searching..."
                     def add_worker():
                         items = self.player.fetch_info(q, max_results=1)
                         if items:
                             self.player.add_top(items[0])
-                            self.message = f"Added: {items[0]['title']}"
+                            self.message = f"Added: {items[0][0]}"
                         else:
                             self.message = "Not found."
                     threading.Thread(target=add_worker, daemon=True).start()
-                self.screen = "home"
             elif ch == ord('/'):
-                # search mode: allow multi-select
                 self.screen = "search"
                 curses.echo()
                 self.stdscr.nodelay(False)
@@ -222,18 +191,15 @@ class TUI:
                     self.message = f"Found {len(res)} results"
                 threading.Thread(target=search_worker, daemon=True).start()
             elif self.screen == "search" and ch in (ord('a'), ord('A')):
-                # add selected to queue
                 sel = sorted(list(self.search_selected))
                 if not sel and self.search_results:
-                    # if none selected, add the first by default
                     sel = [0]
                 items = [self.search_results[i] for i in sel if i < len(self.search_results)]
                 self.player.add_items(items)
-                self.message = f"Added {len(items)} items to queue"
-                # reset
+                self.message = f"Added {len(items)} items"
                 self.search_selected = set()
                 self.screen = "home"
-            elif self.screen == "search" and ch in (ord('1'),ord('2'),ord('3'),ord('4'),ord('5'),ord('6'),ord('7'),ord('8')):
+            elif self.screen == "search" and ord('1') <= ch <= ord('8'):
                 idx = ch - ord('1')
                 if 0 <= idx < len(self.search_results):
                     if idx in self.search_selected:
@@ -247,15 +213,13 @@ class TUI:
                 elif ch in (curses.KEY_UP, ord('k')):
                     if self.cursor > 0:
                         self.cursor -= 1
-                elif ch in (10, 13):  # Enter
+                elif ch in (10, 13):
                     self.player.play_index(self.cursor)
                 elif ch in (ord('n'), ord('N')):
-                    # next
                     self.player.next()
                 elif ch in (ord('b'), ord('B')):
                     self.player.prev()
-                elif ch in (ord(' '),):
-                    # pause toggle
+                elif ch == ord(' '):
                     self.player.toggle_pause()
                 elif ch in (ord('r'), ord('R')):
                     self.player.repeat_song = not self.player.repeat_song
@@ -264,7 +228,6 @@ class TUI:
                     self.player.repeat_playlist = not self.player.repeat_playlist
                     self.message = f"RepeatPlaylist = {self.player.repeat_playlist}"
                 elif ch in (ord('v'), ord('V')):
-                    # volume adjust: mini prompt
                     curses.echo()
                     self.stdscr.nodelay(False)
                     self.stdscr.addstr(h-6,0,"Set volume 0-100: ")
@@ -274,29 +237,24 @@ class TUI:
                     try:
                         vol = int(v)
                         self.player.set_volume(vol)
-                        self.message = f"Volume set to {vol}"
+                        self.message = f"Volume set {vol}"
                     except:
                         self.message = "Invalid volume"
                 elif ch in (ord('s'), ord('S')):
-                    # save playlist: ask path
                     curses.echo()
                     self.stdscr.nodelay(False)
-                    self.stdscr.addstr(h-6,0,"Save playlist path (full path or ./name): ")
-                    pth = self.stdscr.getstr(h-6, 38).decode("utf-8").strip()
+                    self.stdscr.addstr(h-6,0,"Save playlist path: ")
+                    pth = self.stdscr.getstr(h-6, 25).decode("utf-8").strip()
                     self.stdscr.nodelay(True)
                     curses.noecho()
                     if pth:
-                        try:
-                            save_playlist_to(pth, self.player.queue)
-                            self.message = f"Saved to {pth if pth.endswith('.json') else pth+'.json'}"
-                        except Exception as e:
-                            self.message = f"Save failed: {e}"
+                        save_playlist_to(pth, self.player.queue)
+                        self.message = f"Saved {pth}"
                 elif ch in (ord('o'), ord('O')):
-                    # load playlist
                     curses.echo()
                     self.stdscr.nodelay(False)
                     self.stdscr.addstr(h-6,0,"Load playlist path: ")
-                    pth = self.stdscr.getstr(h-6, 20).decode("utf-8").strip()
+                    pth = self.stdscr.getstr(h-6, 25).decode("utf-8").strip()
                     self.stdscr.nodelay(True)
                     curses.noecho()
                     if pth:
@@ -305,22 +263,4 @@ class TUI:
                             self.player.queue = loaded
                             self.message = f"Loaded {len(loaded)} items"
                         else:
-                            self.message = "Load failed / empty"
-                elif ch in (ord('h'), ord('H')):
-                    # go home
-                    self.screen = "home"
-            else:
-                # global shortcuts
-                if ch in (ord('p'), ord('P')):
-                    # play current or first
-                    if self.player.idx == -1 and self.player.queue:
-                        self.player.play_index(0)
-                    elif self.player.idx >= 0:
-                        self.player.play_index(self.player.idx)
-                elif ch in (ord('n'), ord('N')):
-                    self.player.next()
-                elif ch in (ord('b'), ord('B')):
-                    self.player.prev()
-
-            # small sleep to avoid hogging CPU
-            time.sleep(0.02)
+                            self.message = "Load failed/empty"
